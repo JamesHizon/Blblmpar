@@ -1,0 +1,248 @@
+---
+title: "Blblmpar Vignette"
+author: "James Hizon"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+### Introduction to Bag of Little Bootstraps:
+
+In this package, I worked with a bag of little bootstraps procedure. When the divide and conquer (mapreduce) operation does not work well for combining statistics in the reduce step by simply taking the average confidence interval, we are left with attempting to scale the statistics analytically.
+
+Bag of little bootstraps is basically where we incorporate the features of bootstrap and subsampling to assess the quality of estimators. As noted in the description, the process involves taking a dataset, sampling without replacement the sample s times into sizes b, resampling each until the sample size is n, r times, compute the bootstrap statistic (linear regression coefficient), and then obtain the statistic (95% confidence interval) from the bootstrap statistic.
+
+### Package Optimization:
+
+Originally, the package was created while using a single core processor. In order to optimize on computational efficiency, we choose to work with four core processors (CPUs). 
+
+Beforehand, the package "blblm" was required the following packages: "purrr", "stats", "magrittr", and "tidyverse". After I created a new package through copying and pasting the code, I have seen the need to install the package "furrr" instead of "purrr". Let's load some of these packages.
+
+```{r}
+library(stats)
+library(furrr)
+library(magrittr)
+library(tidyverse)
+```
+
+
+With "furrr", I was able to plan to process my data in the future using 4 clusters. The following was inserted inside my original "blblm()" function, where I use plan() to plan the future event of using multicore processors.
+
+
+```{r}
+# suppressWarnings(plan(multiprocess, workers = cl))
+```
+
+I had to alter, in addition, the arguments used in blblm and change the variable to blblmpar. Then, I had to change the usage of "map" to "future_map" as shown: 
+
+```{r}
+### Parallel Bag of Little Bootstraps Logistic Regression:
+blblmpar <- function(formula, data, m = 10, B = 5000, cl) {
+
+  # Split data into list of m files:
+  data_list <- split_data(data, m)
+  # The following will work occasionally.
+  # May require continual restarting.
+  suppressWarnings(plan(multiprocess, workers = cl))
+  # Generate estimates from each file
+  estimates <- future_map(
+    data_list,
+    ~ lmpar_each_subsample(formula = formula,
+                          data = .,
+                          n = nrow(data),
+                          B = B))
+  res <- list(estimates = estimates,
+              formula = formula)
+  class(res) <- "blblmpar"
+  invisible(res)
+}
+```
+
+The following mapreduce operations required change, otherwise other functions will not be able to be used that require such implementations.
+
+```{r}
+# Obtain mean through map + reduce:
+map_mean <- function(.x, .f, ...) {
+  (future_map(.x, .f, ...) %>% reduce(`+`)) / length(.x)
+}
+
+# Map reduce column bind:
+map_cbind <- function(.x, .f, ...) {
+  future_map(.x, .f, ...) %>% reduce(cbind)
+}
+
+# Map reduce row bind:
+map_rbind <- function(.x, .f, ...) {
+  future_map(.x, .f, ...) %>% reduce(rbind)
+}
+
+```
+
+
+### Splitting data
+
+In the process of bag of little bootstraps procedure, we need to split our data using the following function. This takes a dataset and splits it into m datasets with replacement by using "replace=TRUE".
+
+```{r}
+split_data <- function(data, m) {
+  idx <- sample.int(m, nrow(data),
+                    replace = TRUE)
+  data %>% split(idx)
+}
+```
+
+
+### Linear Regression Estimates:
+
+In order to obtain linear regression estimates, we need to create functions to obtain bag of little bootstrap coefficients and sigma (residual standard error) values. These functions will use the linear model that takes a formula (such as y ~ x to predict on x), a dataset, and fitted weights. First, let us apply it on a fitted linear model inside lmpar.
+
+```{r}
+#' compute the coefficients from fit
+blbcoef <- function(fit) {
+  coef(fit)
+}
+```
+
+```{r}
+blbsigma <- function(fit) {
+  p <- fit$rank
+  y <- model.extract(fit$model, "response")
+  e <- fitted(fit) - y
+  w <- fit$weights
+  sqrt(sum(w * (e^2)) / (sum(w) - p))
+}
+```
+
+
+```{r}
+#' obtain the linear regression estimates based on given the number of repetitions
+lmpar <- function(formula, data, freqs) {
+  # drop the original closure of formula,
+  # otherwise the formula will pick a wront variable from the global scope.
+  environment(formula) <- environment()
+  fit <- lm(formula, data, weights = freqs)
+  list(coef = blbcoef(fit),
+       sigma = blbsigma(fit))
+}
+
+```
+
+
+After creating our function "lmpar"to obtain linear regression estimates, we now compute the regression estimates for a bag of little bootstrap dataset. We use rmultinom() to obtain the estimates from generated multinomially distributed datasets. 
+
+```{r}
+lmpar_each_boot <- function(formula, data, n) {
+  # Generate multinomially distributed random number vectors
+  # and compute multinomial probabilities:
+  freqs <- rmultinom(1, n, rep(1, nrow(data)))
+  lmpar(formula, data, freqs)
+}
+```
+
+Next, we compute the estimate of each subsample as follows.
+
+```{r}
+lmpar_each_subsample <- function(formula, data, n, B) {
+  replicate(B, lmpar_each_boot(formula, data, n),
+            simplify = FALSE)
+}
+```
+
+Thus, we now see how our main function "blblmpar" is constructed.
+In order to use our package, we need to first install the package through "load_all()" using the file "Blblmpar.R". Then, you can load the package, obtain linear regression coefficients, our confidence interval for the regression coefficients, residual standard errors (set confidence = TRUE for lower and upper bound of confidence interval), and make predictions using a dataframe.
+
+```{r}
+library(Blblmpar)
+```
+
+### Examples
+
+Here is an example of calling our blblmpar() function.
+We will specify the number of cluster to be 4 for multicore processing.
+Otherwise, we will leave the "cl" parameter equal to 1.
+
+```{r}
+par_fit <- blblmpar(mpg ~ wt * hp, data = mtcars, m = 3, B = 100, cl = 4)
+```
+
+### Warning: 
+When using cl = 4, this may or may not work the first time.
+In order to solve the error, go to "Build" and click on "Install and Restart."
+
+```{r}
+fit <- blblmpar(mpg ~ wt * hp, data = mtcars, m = 3, B = 100, cl = 1)
+```
+
+
+```{r}
+coef(fit)
+```
+
+```{r}
+confint(fit, c("wt", "hp"))
+```
+
+```{r}
+sigma(fit)
+```
+
+```{r}
+sigma(fit, confidence = TRUE)
+```
+
+```{r}
+predict(fit, data.frame(wt = c(2.5, 3), hp = c(150, 170)))
+```
+
+```{r}
+predict(fit, data.frame(wt = c(2.5, 3), hp = c(150, 170)), confidence = TRUE)
+```
+
+### Create tests:
+
+```{r}
+library(usethis)
+library(testthat)
+```
+
+
+
+
+```{r}
+# # Conduct test with lm:
+# # Original way:
+# lmfit <- lm(mpg ~ wt * hp, data = mtcars)
+# lmfit$coefficients
+# 
+# # Bag of little bootstrap method:
+# blblmfit <- blblmpar(mpg ~ wt * hp, data = mtcars, m = 3, B = 100, cl = 1)
+# coef(blblmfit)
+# 
+# # Use expect_that:
+# expect_that(coef(blblmfit), lmfit$coefficients)
+```
+
+
+### Run check to find common problems in code:
+
+```{r}
+### Comment out for easier knitting:
+# - Just run from console or uncomment out when working with ".Rmd" file.
+#devtools::check()
+```
+
+### Checks and Tests Summary
+
+After writing checks and tests, we run into errors. What is interesting is that we can still use our R package with "load_all", but when I use "devtools::checks()", I run into errors like 'could not find function "plan"'. When running my tests, I am trying to run my test to observe coefficients and expected class. I am unsure of my error, however.
+
+
